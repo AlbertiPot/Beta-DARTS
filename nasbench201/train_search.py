@@ -36,7 +36,7 @@ parser.add_argument('--learning_rate_min', type=float, default=0.001, help='min 
 parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
 parser.add_argument('--weight_decay', type=float, default=3e-4, help='weight decay')  # DARTS: 3e-4  RDARTS: 81e-4
 parser.add_argument('--report_freq', type=float, default=50, help='report frequency')
-parser.add_argument('--gpu', type=int, default=4, help='gpu device id')
+parser.add_argument('--gpu', type=int, default=0, help='gpu device id')
 parser.add_argument('--epochs', type=int, default=100, help='num of training epochs')
 parser.add_argument('--init_channels', type=int, default=16, help='num of init channels')
 parser.add_argument('--layers', type=int, default=8, help='total number of layers')
@@ -55,8 +55,8 @@ parser.add_argument('--perturb_alpha', type=str, default='none', help='perturb f
 parser.add_argument('--epsilon_alpha', type=float, default=0.3, help='max epsilon for alpha')
 args = parser.parse_args()
 
-args.save = '../experiments/nasbench201/{}/search-{}-{}-{}'.format(
-    args.dataset, args.save, time.strftime("%Y%m%d-%H%M%S"), args.seed)
+args.save = 'results/nasbench201/{}/search-{}-seed{}-{}'.format(
+    args.dataset, args.save, args.seed, time.strftime("%Y%m%d-%H%M%S"))
 
 if args.unrolled:
     args.save += '-unrolled'
@@ -68,14 +68,13 @@ if args.cutout:
     args.save += '-cutout-' + str(args.cutout_length) + '-' + str(args.cutout_prob)
 if not args.perturb_alpha == 'none':
     args.save += '-alpha-' + args.perturb_alpha + '-' + str(args.epsilon_alpha)
-args.save += '-' + str(np.random.randint(10000))
 
 utils.create_exp_dir(args.save, scripts_to_save=glob.glob('*.py'))
 
 log_format = '%(asctime)s %(message)s'
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
     format=log_format, datefmt='%m/%d %I:%M:%S %p')
-fh = logging.FileHandler(os.path.join(args.save, 'log.txt'))
+fh = logging.FileHandler(os.path.join(args.save, 'train_search.log'))
 fh.setFormatter(logging.Formatter(log_format))
 logging.getLogger().addHandler(fh)
 writer = SummaryWriter(args.save + '/runs')
@@ -88,7 +87,7 @@ else:
 
 
 def main():
-    torch.set_num_threads(3)
+    # torch.set_num_threads(3)
     if not torch.cuda.is_available():
         logging.info('no gpu device available')
         sys.exit(1)
@@ -109,7 +108,7 @@ def main():
     elif args.perturb_alpha == 'random':
         perturb_alpha = Random_alpha
     
-    api = API('/remote-home/share/share/dataset/NAS-Bench-201-v1_0-e61699.pth')
+    api = API('/data/gbc/Datasets/nasbench201/NAS-Bench-201-v1_1-096897.pth')
     criterion = nn.CrossEntropyLoss()
     criterion = criterion.cuda()
     model = Network(C=args.init_channels, N=5, max_nodes=4, num_classes=n_classes, criterion=criterion)  # N=5/1/3
@@ -145,18 +144,20 @@ def main():
     train_queue = torch.utils.data.DataLoader(
         train_data, batch_size=args.batch_size,
         sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[:split_train]),
-        pin_memory=True)
+        pin_memory=True, num_workers=8)
 
     valid_queue = torch.utils.data.DataLoader(
         train_data, batch_size=args.batch_size,
         sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[split_valid:num_train]),
-        pin_memory=True)
+        pin_memory=True, num_workers=8)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, float(args.epochs), eta_min=args.learning_rate_min)
 
     architect = Architect(model, args)
 
+    best_metric = 0
+    best_epoch = 0
     for epoch in range(args.epochs):
         scheduler.step()
         lr = scheduler.get_lr()[0]
@@ -190,6 +191,10 @@ def main():
         writer.add_scalar('Acc/valid', valid_acc, epoch)
         writer.add_scalar('Obj/valid', valid_obj, epoch)
 
+        if valid_acc > best_metric:
+            best_metric = valid_acc
+            best_epoch = epoch
+
         # nasbench201
         result = api.query_by_arch(model.genotype(), hp='200')  # hp='200'
         logging.info('{:}'.format(result))
@@ -207,7 +212,7 @@ def main():
             'alpha': model.arch_parameters()
         }, False, args.save)
     writer.close()
-
+    logging.info('best arch in epoch {} with valid_acc {}'.format(best_epoch, best_metric))
 
 def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, perturb_alpha, epsilon_alpha, epoch):
     objs = utils.AvgrageMeter()
@@ -222,7 +227,13 @@ def train(train_queue, valid_queue, model, architect, criterion, optimizer, lr, 
         target = target.cuda(non_blocking=True)
 
         # get a random minibatch from the search queue with replacement
-        input_search, target_search = next(iter(valid_queue))
+        try:
+            input_search, target_search = next(valid_queue_iter)
+        except:
+            valid_queue_iter = iter(valid_queue)
+            input_search, target_search = next(valid_queue_iter)
+        # input_search, target_search = next(iter(valid_queue))
+
         input_search = input_search.cuda()
         target_search = target_search.cuda(non_blocking=True)
 
